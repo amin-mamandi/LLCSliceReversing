@@ -438,6 +438,9 @@ int main(int argc, char *argv[]) {
           (int)measure_slice_perf(vaddr, slices, event, base);
       slice_c = (int)measure_slice_perf(vaddr + 32, slices,
                                         event, base);
+      if (slice != slice_c) {
+        printf("Mismatch: %d != %d\n", slice, slice_c);
+      }
     } while (slice != slice_c);
 
     if (slice == -1) continue; // invalid measurement
