@@ -431,7 +431,15 @@ int main(int argc, char *argv[]) {
     void *vaddr = allocated + offset;
     *(volatile char *)vaddr; // fault in the page
     void *paddr = (void *)get_physical_address((pointer)vaddr);
-    int slice = (int)measure_slice_perf(vaddr, slices, event, base);
+
+    int slice, slice_c;
+    do {
+      slice =
+          (int)measure_slice_perf(vaddr, slices, event, base);
+      slice_c = (int)measure_slice_perf(vaddr + 32, slices,
+                                        event, base);
+    } while (slice != slice_c);
+
     if (slice == -1) continue; // invalid measurement
     if (slice_counts[slice] < threshold) {
       slice_addrs[slice][slice_counts[slice]++] = (uint64_t)paddr;
