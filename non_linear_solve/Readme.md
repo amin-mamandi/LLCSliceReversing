@@ -1,5 +1,5 @@
 # Reverse Engineering of Nonlinear Hash Functions
-This is an approach that allows to solce nonlinear hash functions.
+This is an approach that allows to solve nonlinear hash functions.
 We observed that non-linear slice addressing functions consist of a non-linear mixer that takes XOR chains as an input for the lower bits, and linear XOR chains for the upper bits.
 
 We split out reverse engineering of the non-linear mixer into two parts:
