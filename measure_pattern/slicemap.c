@@ -151,7 +151,7 @@ int get_slice_info(const char *prefix, char *type_value) {
 
 // ---------------------------------------------------------------------------
 size_t find_slice_perf(void *address, int repeat, int *slice_count,
-                       unsigned long *config, int *base) {
+                       unsigned long *config, int *base, int *nt) {
 #define REP4(x) x x x x
 #define REP16(x) REP4(x) REP4(x) REP4(x) REP4(x)
 #define REP256(x)                                                              \
@@ -165,6 +165,10 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
       REP16(x) REP16(x)
 #define REP1K(x) REP256(x) REP256(x) REP256(x) REP256(x)
 #define REP4K(x) REP1K(x) REP1K(x) REP1K(x) REP1K(x)
+
+#define NT_STORE(addr) \
+    asm volatile("movnti %1, (%0)\n\t" "sfence\n\t" \
+                 : : "r"(addr), "r"((uint64_t)0xdeadbeefULL) : "memory")
 
   size_t hist[256];
   memset(hist, 0, sizeof(hist));
@@ -211,9 +215,14 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
           ioctl(fds[i], PERF_EVENT_IOC_ENABLE, 0);
           ioctl(fds[i], PERF_EVENT_IOC_RESET, 0);
 
+          if (nt) {
+          REP4K(NT_STORE(address);)
+            asm volatile("mfence" ::: "memory");
+          } else {
           REP4K(asm volatile("mfence; clflush (%0); mfence; \n" : : "r"(
               address) : "memory");
                 *(volatile char *)address;)
+          }
 
           ioctl(fds[i], PERF_EVENT_IOC_DISABLE, 0);
 
@@ -227,6 +236,12 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
             qualify = 1;
           }
           sum += result;
+            if(nt) {
+              /* drain TOR to prevent count bleed into next probe */
+              asm volatile("mfence\n\t clflush (%0)\n\t mfence\n\t" : : "r"(address) : "memory");
+              *(volatile char *)address;
+              asm volatile("mfence" ::: "memory");
+            }
         }
         if (sum >= 4096 && sum < 8000 && qualify) {
           // printf("-> Could be 0x%zx (%lld)\n", config, sum);
@@ -250,7 +265,7 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
 }
 
 size_t measure_slice_perf(void *address, int slices, unsigned long config,
-                          int type) {
+                          int type, int nt) {
 #define REP4(x) x x x x
 #define REP16(x) REP4(x) REP4(x) REP4(x) REP4(x)
 #define REP256(x)                                                              \
@@ -264,6 +279,11 @@ size_t measure_slice_perf(void *address, int slices, unsigned long config,
       REP16(x) REP16(x)
 #define REP1K(x) REP256(x) REP256(x) REP256(x) REP256(x)
 #define REP4K(x) REP1K(x) REP1K(x) REP1K(x) REP1K(x)
+
+#define REP8K(x) REP4K(x) REP4K(x)
+#define NT_STORE(addr) \
+    asm volatile("movnti %1, (%0)\n\t" "sfence\n\t" \
+                 : : "r"(addr), "r"((uint64_t)0xdeadbeefULL) : "memory")
 
   size_t hist[256];
   memset(hist, 0, sizeof(hist));
@@ -280,15 +300,26 @@ size_t measure_slice_perf(void *address, int slices, unsigned long config,
     ioctl(fds[i], PERF_EVENT_IOC_ENABLE, 0);
     ioctl(fds[i], PERF_EVENT_IOC_RESET, 0);
 
+    if (nt) {
+    REP8K(NT_STORE(address);)
+      asm volatile("mfence" ::: "memory");
+    } else {
     REP4K(asm volatile(
               "mfence; clflush (%0); mfence; \n" : : "r"(address) : "memory");
           *(volatile char *)address;)
     REP4K(asm volatile(
               "mfence; clflush (%0); mfence; \n" : : "r"(address) : "memory");
           *(volatile char *)address;)
+    }
 
     ioctl(fds[i], PERF_EVENT_IOC_DISABLE, 0);
 
+    if(nt) {
+      /* drain TOR to prevent count bleed into next probe */
+      asm volatile("mfence\n\t clflush (%0)\n\t mfence\n\t" : : "r"(address) : "memory");
+      *(volatile char *)address;
+      asm volatile("mfence" ::: "memory");
+    }
     long long result = 0;
     int ret = read(fds[i], &result, sizeof(result));
     hist[i] = result;
@@ -320,7 +351,7 @@ char __attribute__((aligned(4096))) data[4096 * 1024];
 
 void print_usage(const char *prog_name) {
   printf(
-      "Usage: %s [--memsize <GB>] [--threshold <int>] [--base <hex> --event <hex> --slices <int>]\n",
+      "Usage: %s [--memsize <GB>] [--threshold <int>] [--base <hex> --event <hex> --slices <int>] [ --nt <int>]\n",
       prog_name);
 }
 
@@ -330,7 +361,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (argc < 1 || argc > 11) {
+  if (argc < 1 || argc > 13) {
     print_usage(argv[0]);
     return 1;
   }
@@ -340,6 +371,7 @@ int main(int argc, char *argv[]) {
   int base_set = 0, event_set = 0, slices_set = 0;
   uint64_t memsize = 1ULL * 1024 * 1024 * 1024;
   int threshold = 1000;
+  int nt = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--memsize") == 0) {
@@ -380,6 +412,13 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
       }
+    } else if (strcmp(argv[i], "--nt") == 0) {
+      if (i + 1 < argc) {
+        nt = atoi(argv[++i]);
+      } else {
+        print_usage(argv[0]);
+        return 1;
+      }
     } else {
       print_usage(argv[0]);
       return 1;
@@ -405,7 +444,7 @@ int main(int argc, char *argv[]) {
   if (!base_set || !event_set || !slices) {
     printf(
         "Looking for performance counter to use, this might take a while...\n");
-    int perf = find_slice_perf(data, 3, &slices, &event, &base);
+    int perf = find_slice_perf(data, 3, &slices, &event, &base, &nt);
   }
 
   printf("%d slices, base 0x%x, event 0x%zx\n", slices, base, event);
@@ -435,9 +474,9 @@ int main(int argc, char *argv[]) {
     int slice, slice_c;
     do {
       slice =
-          (int)measure_slice_perf(vaddr, slices, event, base);
+          (int)measure_slice_perf(vaddr, slices, event, base, nt);
       slice_c = (int)measure_slice_perf(vaddr + 32, slices,
-                                        event, base);
+                                        event, base, nt);
       if (slice != slice_c) {
         printf("Mismatch: %d != %d\n", slice, slice_c);
       }
