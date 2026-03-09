@@ -106,7 +106,7 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
     }
   }
 
-  if (subnuma){
+  if (subnuma && *subnuma == 1) {
     slices=10;
   }    
 
@@ -245,10 +245,11 @@ char __attribute__((aligned(4096))) data[4096 * 1024];
 int main(int argc, char *argv[]) {
 
   int subnuma = 0;
+  
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--subnuma") == 0) {
       if (i + 1 < argc) {
-        subnuma = atoi(argv[++i]);
+        subnuma = 1
       }
     }
   }
