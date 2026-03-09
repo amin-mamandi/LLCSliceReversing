@@ -68,7 +68,7 @@ int get_slice_info(const char *prefix, char *type_value) {
 
 // ---------------------------------------------------------------------------
 size_t find_slice_perf(void *address, int repeat, int *slice_count,
-                       unsigned long *config, int *base) {
+                       unsigned long *config, int *base, int *subnuma) {
 #define REP4(x) x x x x
 #define REP16(x) REP4(x) REP4(x) REP4(x) REP4(x)
 #define REP256(x)                                                              \
@@ -105,6 +105,10 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
       return 1;
     }
   }
+
+  if (subnuma){
+    slices=10;
+  }    
 
   int did_find = 0;
   void *start_address = address;
@@ -239,6 +243,16 @@ int log_2(uint64_t x) {
 char __attribute__((aligned(4096))) data[4096 * 1024];
 
 int main(int argc, char *argv[]) {
+
+  int subnuma = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--subnuma") == 0) {
+      if (i + 1 < argc) {
+        subnuma = atoi(argv[++i]);
+      }
+    }
+  }
+
   memset(data, 1, sizeof(data));
 
   unsigned long config;
@@ -250,7 +264,7 @@ int main(int argc, char *argv[]) {
   // config = 0x1bc10000ff34; // NOTE: ice lake server can't be brute forced at
   // the moment, as they have the 0x1bc1 extended umask. use this config for ice
   // lake
-  int perf = find_slice_perf(data, 3, &slices, &config, &perf_base);
+  int perf = find_slice_perf(data, 3, &slices, &config, &perf_base, &subnuma);
 
   printf("%d slices, base 0x%x, event 0x%zx\n", slices, perf_base, config);
 
