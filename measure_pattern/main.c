@@ -130,7 +130,7 @@ int get_slice_info(const char *prefix, char *type_value) {
 
 // ---------------------------------------------------------------------------
 size_t find_slice_perf(void *address, int repeat, int *slice_count,
-                       unsigned long *config, int *base) {
+                       unsigned long *config, int *base, int *subnuma) {
 #define REP4(x) x x x x
 #define REP16(x) REP4(x) REP4(x) REP4(x) REP4(x)
 #define REP256(x)                                                              \
@@ -165,6 +165,10 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
       printf("Neither uncore_cbox_0 nor uncore_cha_0 found.\n");
       return 1;
     }
+  }
+
+  if(subnuma && *subnuma == 1) {
+    slices = 10;
   }
 
   int did_find = 0;
@@ -309,7 +313,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  if (argc < 1 || argc > 9) {
+  if (argc < 1 || argc > 11) {
     print_usage(argv[0]);
     return 1;
   }
@@ -317,6 +321,7 @@ int main(int argc, char *argv[]) {
   int bit = 0, slices = -1, base = 0;
   unsigned long event = 0;
   int base_set = 0, event_set = 0, slices_set = 0;
+  int subnuma = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--bit") == 0) {
@@ -346,6 +351,13 @@ int main(int argc, char *argv[]) {
       if (i + 1 < argc) {
         slices = atoi(argv[++i]);
         slices_set = 1;
+      } else {
+        print_usage(argv[0]);
+        return 1;
+      } 
+    } else if (strcmp(argv[i], "--subnuma") == 0) {
+      if (i + 1 < argc) {
+        subnuma = 1;
       } else {
         print_usage(argv[0]);
         return 1;
@@ -392,7 +404,7 @@ int main(int argc, char *argv[]) {
   if (!base_set || !event_set || !slices) {
     printf(
         "Looking for performance counter to use, this might take a while...\n");
-    int perf = find_slice_perf(data, 3, &slices, &event, &base);
+    int perf = find_slice_perf(data, 3, &slices, &event, &base, &subnuma);
   }
 
   printf("%d slices, base 0x%x, event 0x%zx\n", slices, base, event);
@@ -422,7 +434,7 @@ int main(int argc, char *argv[]) {
     void *current_physical_address =
         get_physical_address(current_virtual_address);
     // printf("Virtual: %p, Physical: %p, Slice: %d\n", current_virtual_address,
-    // current_physical_address, current_slice);
+    // current_physical_address, slice);
     do {
       slice =
           (int)measure_slice_perf(current_virtual_address, slices, event, base);

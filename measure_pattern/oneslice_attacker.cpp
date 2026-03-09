@@ -85,6 +85,8 @@ int g_base_type  = -1;    // perf base type for uncore_cha_0
 uint64_t g_event_cfg = 0; // perf event config
 int g_target_slice = 0;   // which slice to attack
 int g_target_n   = 500;   // target number of addresses to collect
+int g_use_embedded_hash = 0;   // use recovered 10-slice hash instead of CHA probing
+int g_verify_hash = 0;         // when using hash, also verify against CHA probing
 // ----------------------------------------------
 
 typedef uint64_t pointer;
@@ -104,6 +106,7 @@ typedef uint64_t pointer;
 std::vector <std::vector<pointer>> sets; // discovered sets
 
 void *mapping = NULL; // large memory mapping
+int g_pagemap_fd = -1;
 
 // ----------------------------------------------
 size_t getPhysicalMemorySize() {
@@ -189,6 +192,89 @@ static int perf_open(int type, uint64_t config, int cpu) {
     attr.inherit     = 1;
     attr.sample_type = PERF_SAMPLE_IDENTIFIER;
     return (int)syscall(__NR_perf_event_open, &attr, -1, cpu, -1, 0);
+}
+
+static inline uint64_t frame_number_from_pagemap(uint64_t pagemap_value) {
+    return pagemap_value & ((1ULL << 55) - 1);
+}
+
+static void init_pagemap() {
+    g_pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
+    if (g_pagemap_fd < 0) {
+        perror("open /proc/self/pagemap");
+        exit(1);
+    }
+}
+
+static uint64_t get_physical_address(uint64_t virtual_addr) {
+    uint64_t value = 0;
+    off_t offset = (off_t)((virtual_addr / g_page_size) * sizeof(value));
+    ssize_t got = pread(g_pagemap_fd, &value, sizeof(value), offset);
+    if (got != (ssize_t)sizeof(value)) return 0;
+    if ((value & (1ULL << 63)) == 0) return 0;
+    uint64_t frame_num = frame_number_from_pagemap(value);
+    return (frame_num * g_page_size) | (virtual_addr & (g_page_size - 1));
+}
+
+static inline int B(uint64_t x, int pos) {
+    return (int)((x >> pos) & 1ULL);
+}
+
+// Recovered chain for bit0 (L_6b).
+static inline int hash_l6b(uint64_t x) {
+    return B(x, 6) ^ B(x, 8) ^ B(x, 9) ^ B(x, 10) ^ B(x, 14) ^ B(x, 15) ^
+           B(x, 17) ^ B(x, 18) ^ B(x, 20) ^ B(x, 23) ^ B(x, 27) ^ B(x, 30) ^
+           B(x, 31) ^ B(x, 34) ^ B(x, 36) ^ B(x, 38);
+}
+
+// Reused linear chains for mixer bits1/2.
+static inline int hash_l6c(uint64_t x) {
+    return B(x, 6) ^ B(x, 11) ^ B(x, 12) ^ B(x, 16) ^ B(x, 18) ^ B(x, 21) ^
+           B(x, 22) ^ B(x, 23) ^ B(x, 24) ^ B(x, 26) ^ B(x, 30) ^ B(x, 31) ^
+           B(x, 32) ^ B(x, 35) ^ B(x, 38);
+}
+
+static inline int hash_l8b(uint64_t x) {
+    return B(x, 8) ^ B(x, 13) ^ B(x, 14) ^ B(x, 18) ^ B(x, 20) ^ B(x, 23) ^
+           B(x, 24) ^ B(x, 25) ^ B(x, 26) ^ B(x, 28) ^ B(x, 32) ^ B(x, 33) ^
+           B(x, 34) ^ B(x, 37);
+}
+
+// Recovered mixer input chains for bit3.
+static inline int hash_c0(uint64_t x) {
+    return B(x, 7) ^ B(x, 12) ^ B(x, 13) ^ B(x, 17) ^ B(x, 19) ^ B(x, 22) ^
+           B(x, 23) ^ B(x, 24) ^ B(x, 25) ^ B(x, 27) ^ B(x, 32) ^ B(x, 33) ^
+           B(x, 36);
+}
+
+static inline int hash_c1(uint64_t x) {
+    return B(x, 9) ^ B(x, 14) ^ B(x, 15) ^ B(x, 19) ^ B(x, 21) ^ B(x, 24) ^
+           B(x, 25) ^ B(x, 26) ^ B(x, 27) ^ B(x, 29) ^ B(x, 33) ^ B(x, 34) ^
+           B(x, 35);
+}
+
+static inline int hash_c2(uint64_t x) {
+    return B(x, 10) ^ B(x, 15) ^ B(x, 16) ^ B(x, 20) ^ B(x, 22) ^ B(x, 25) ^
+           B(x, 26) ^ B(x, 27) ^ B(x, 28) ^ B(x, 30) ^ B(x, 34) ^ B(x, 35) ^
+           B(x, 36);
+}
+
+static inline int hash_c3(uint64_t x) {
+    int out = B(x, 11) ^ B(x, 16) ^ B(x, 17) ^ B(x, 21) ^ B(x, 23) ^ B(x, 26) ^
+              B(x, 27) ^ B(x, 28) ^ B(x, 29) ^ B(x, 35) ^ B(x, 36);
+    return out;
+}
+
+// Embedded 10-slice function:
+// slice = bit0 | (mixer_c5 << 1), with bit3 recovered as c0&c1&(c2|c3).
+static inline int compute_slice_10_embedded(uint64_t phys_addr) {
+    int bit0 = hash_l6b(phys_addr) & 1;
+    int m3 = (hash_c0(phys_addr) & hash_c1(phys_addr) &
+              (hash_c2(phys_addr) | hash_c3(phys_addr))) & 1;
+    int m2 = ((~m3) & hash_l6c(phys_addr)) & 1;
+    int m1 = ((~m3) & hash_l8b(phys_addr)) & 1;
+    int mixer = (m1 << 0) | (m2 << 1) | (m3 << 2);
+    return bit0 | (mixer << 1);
 }
 
 // Arm all CHA counters, fire 4096 NT stores, read back counts.
@@ -493,12 +579,14 @@ int main(int argc, char *argv[]) {
         {"event",        required_argument, 0, 'E'},
         {"slices",       required_argument, 0, 'S'},
         {"target-slice", required_argument, 0, 'T'},
+        {"use-embedded-hash", no_argument, 0, 'H'},
+        {"verify-hash",       no_argument, 0, 'V'},
         {0, 0, 0, 0}
     };
 
     int c;
     // parse command line arguments
-    while ((c = getopt_long(argc, argv, "a:c:g:m:k:v:f:n:", long_options, NULL)) != EOF) {
+    while ((c = getopt_long(argc, argv, "a:c:g:m:k:v:f:n:HV", long_options, NULL)) != EOF) {
         switch (c) {
         case 'a':
             g_access_type = (strncmp(optarg, "write", 5) == 0) ? 1 : 0;
@@ -537,12 +625,17 @@ int main(int argc, char *argv[]) {
         case 'T':
             g_target_slice = atoi(optarg);
             break;
+        case 'H':
+            g_use_embedded_hash = 1;
+            break;
+        case 'V':
+            g_verify_hash = 1;
+            break;
         default:
             printf("Usage: %s [options]\n"
                    "Required:\n"
-                   "  --base    <hex>        perf base type for uncore_cha_0\n"
-                   "  --event   <hex>        perf event config (e.g. 0xf50)\n"
                    "  --slices  <N>          number of LLC slices (CHAs)\n"
+                   "  --base/--event         required only for perf mode or --verify-hash\n"
                    "Optional:\n"
                    "  --target-slice <N>     which slice to attack (default: 0)\n"
                    "  -m <MB>                memory size in MB (default: 1024)\n"
@@ -552,19 +645,30 @@ int main(int argc, char *argv[]) {
                    "  -a <read|write>        access type (default: read)\n"
                    "  -f <0-3>               cache mode (default: 1)\n"
                    "  -n <threads>           number of attack threads (default: 1)\n"
-                   "  -v <level>             verbosity (default: 1)\n",
+                   "  -v <level>             verbosity (default: 1)\n"
+                   "  --use-embedded-hash    use embedded recovered 10-slice function\n"
+                   "  --verify-hash          verify hash prediction with CHA probing\n",
                    argv[0]);
             exit(0);
         }
     }
 
     // Validate required parameters
-    if (g_base_type < 0 || g_event_cfg == 0 || g_nslices <= 0) {
-        fprintf(stderr, "Error: --base, --event, and --slices are all required.\n");
+    if (g_nslices <= 0) {
+        fprintf(stderr, "Error: --slices is required.\n");
+        exit(1);
+    }
+    if ((!g_use_embedded_hash || g_verify_hash) &&
+        (g_base_type < 0 || g_event_cfg == 0)) {
+        fprintf(stderr, "Error: --base and --event are required in perf mode or with --verify-hash.\n");
         exit(1);
     }
     if (g_target_slice < 0 || g_target_slice >= g_nslices) {
         fprintf(stderr, "Error: --target-slice must be in [0, %d)\n", g_nslices);
+        exit(1);
+    }
+    if (g_use_embedded_hash && g_nslices != 10) {
+        fprintf(stderr, "Error: embedded hash mode currently supports only --slices 10\n");
         exit(1);
     }
 
@@ -584,6 +688,7 @@ int main(int argc, char *argv[]) {
 
     srand(time(NULL));
     g_page_size = sysconf(_SC_PAGESIZE);
+    init_pagemap();
     setupMapping();
 
     printf("=== oneslice_attacker ===\n");
@@ -596,6 +701,14 @@ int main(int argc, char *argv[]) {
     printf("Access mode  : %s\n", getAccessModeString(g_access_type));
     printf("Threads      : %d\n", num_threads);
     printf("CPU affinity : %d\n", cpu_affinity);
+
+    if (g_use_embedded_hash) {
+        printf("Slice source : embedded 10-slice hash%s\n",
+               g_verify_hash ? " + CHA verify" : "");
+    } else {
+        printf("Slice source : CHA perf probing\n");
+    }
+
     printf("\n");
 
     // ---- Slice discovery using CHA perf counters ----
@@ -604,6 +717,9 @@ int main(int argc, char *argv[]) {
     std::vector<pointer> slice_addrs;
     long long total_probes = 0;
     long long accepted_probes = 0;
+    long long hash_checked = 0;
+    long long hash_correct = 0;
+    long long hash_mismatch = 0;
 
     while ((int)slice_addrs.size() < g_target_n) {
         // pick a random cache-line-aligned address from the mapping
@@ -614,8 +730,22 @@ int main(int argc, char *argv[]) {
         *(volatile char *)cl = 0;
 
         total_probes++;
-
-        int slice = identify_slice(cl, g_nslices, g_base_type, g_event_cfg);
+        int slice = -1;
+        if (g_use_embedded_hash) {
+            uint64_t pa = get_physical_address((uint64_t)cl);
+            if (pa == 0) continue;
+            slice = compute_slice_10_embedded(pa);
+            if (g_verify_hash) {
+                int measured = identify_slice(cl, g_nslices, g_base_type, g_event_cfg);
+                if (measured >= 0) {
+                    hash_checked++;
+                    if (measured == slice) hash_correct++;
+                    else hash_mismatch++;
+                }
+            }
+        } else {
+            slice = identify_slice(cl, g_nslices, g_base_type, g_event_cfg);
+        }
 
         if (slice >= 0) {
             accepted_probes++;
@@ -637,6 +767,13 @@ int main(int argc, char *argv[]) {
     printf("  Accepted      : %lld (%.1f%%)\n", accepted_probes,
            total_probes > 0 ? 100.0 * accepted_probes / total_probes : 0.0);
     printf("  Addresses     : %zu in slice %d\n\n", slice_addrs.size(), g_target_slice);
+    if (g_use_embedded_hash && g_verify_hash && hash_checked > 0) {
+        printf("Hash verification:\n");
+        printf("  Compared      : %lld\n", hash_checked);
+        printf("  Correct       : %lld (%.2f%%)\n", hash_correct,
+               100.0 * (double)hash_correct / (double)hash_checked);
+        printf("  Mismatch      : %lld\n\n", hash_mismatch);
+    }
 
     // Store found addresses as a single set
     sets.push_back(slice_addrs);
