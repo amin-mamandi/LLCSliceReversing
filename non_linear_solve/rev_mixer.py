@@ -4,7 +4,7 @@ import tempfile
 
 from slice_functions import XorChain
 
-FILE_NAME = "pattern_lab73/pattern_0.txt"
+FILE_NAME = "pattern_lab73/pattern_00.txt"
 
 
 def _b(x, pos):
