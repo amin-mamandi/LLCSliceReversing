@@ -87,6 +87,11 @@ int g_target_slice = 0;   // which slice to attack
 int g_target_n   = 500;   // target number of addresses to collect
 int g_use_embedded_hash = 0;   // use recovered 10-slice hash instead of CHA probing
 int g_verify_hash = 0;         // when using hash, also verify against CHA probing
+int g_print_confusion = 0;     // print confusion matrix when verifying hash
+int g_auto_tune_hash = 0;      // search single-bit chain edits for better accuracy
+int g_tune_bit_min = 6;        // min PA bit for auto-tune
+int g_tune_bit_max = 38;       // max PA bit for auto-tune
+int g_tune_top = 3;            // top candidate edits to print
 // ----------------------------------------------
 
 typedef uint64_t pointer;
@@ -220,6 +225,12 @@ static inline int B(uint64_t x, int pos) {
     return (int)((x >> pos) & 1ULL);
 }
 
+struct VerifySample {
+    uint64_t pa;
+    int measured;
+    int predicted;
+};
+
 // Recovered chain for bit0 (L_6b).
 static inline int hash_l6b(uint64_t x) {
     return B(x, 6) ^ B(x, 8) ^ B(x, 9) ^ B(x, 10) ^ B(x, 14) ^ B(x, 15) ^
@@ -243,14 +254,14 @@ static inline int hash_l8b(uint64_t x) {
 // Recovered mixer input chains for bit3.
 static inline int hash_c0(uint64_t x) {
     return B(x, 7) ^ B(x, 12) ^ B(x, 13) ^ B(x, 17) ^ B(x, 19) ^ B(x, 22) ^
-           B(x, 23) ^ B(x, 24) ^ B(x, 25) ^ B(x, 27) ^ B(x, 32) ^ B(x, 33) ^
+           B(x, 23) ^ B(x, 24) ^ B(x, 25) ^ B(x, 27) ^ B(x, 31) ^ B(x, 32) ^ B(x, 33) ^
            B(x, 36);
 }
 
 static inline int hash_c1(uint64_t x) {
     return B(x, 9) ^ B(x, 14) ^ B(x, 15) ^ B(x, 19) ^ B(x, 21) ^ B(x, 24) ^
            B(x, 25) ^ B(x, 26) ^ B(x, 27) ^ B(x, 29) ^ B(x, 33) ^ B(x, 34) ^
-           B(x, 35);
+           B(x, 35) ^ B(x, 38);
 }
 
 static inline int hash_c2(uint64_t x) {
@@ -261,8 +272,157 @@ static inline int hash_c2(uint64_t x) {
 
 static inline int hash_c3(uint64_t x) {
     int out = B(x, 11) ^ B(x, 16) ^ B(x, 17) ^ B(x, 21) ^ B(x, 23) ^ B(x, 26) ^
-              B(x, 27) ^ B(x, 28) ^ B(x, 29) ^ B(x, 35) ^ B(x, 36);
+              B(x, 27) ^ B(x, 28) ^ B(x, 29) ^ B(x, 31) ^ B(x, 35) ^ B(x, 36);
     return out;
+}
+
+static const int CHAIN_L6B_BITS[] = {6, 8, 9, 10, 14, 15, 17, 18, 20, 23, 27, 30, 31, 34, 36, 38};
+static const int CHAIN_L6C_BITS[] = {6, 11, 12, 16, 18, 21, 22, 23, 24, 26, 30, 31, 32, 35, 38};
+static const int CHAIN_L8B_BITS[] = {8, 13, 14, 18, 20, 23, 24, 25, 26, 28, 32, 33, 34, 37};
+static const int CHAIN_C0_BITS[]  = {7, 12, 13, 17, 19, 22, 23, 24, 25, 27, 32, 33, 36};
+static const int CHAIN_C1_BITS[]  = {9, 14, 15, 19, 21, 24, 25, 26, 27, 29, 33, 34, 35};
+static const int CHAIN_C2_BITS[]  = {10, 15, 16, 20, 22, 25, 26, 27, 28, 30, 34, 35, 36};
+static const int CHAIN_C3_BITS[]  = {11, 16, 17, 21, 23, 26, 27, 28, 29, 35, 36};
+
+static bool chain_contains_bit(int chain_idx, int bit) {
+    const int *arr = NULL;
+    int n = 0;
+    switch (chain_idx) {
+    case 0: arr = CHAIN_L6B_BITS; n = sizeof(CHAIN_L6B_BITS)/sizeof(CHAIN_L6B_BITS[0]); break;
+    case 1: arr = CHAIN_L6C_BITS; n = sizeof(CHAIN_L6C_BITS)/sizeof(CHAIN_L6C_BITS[0]); break;
+    case 2: arr = CHAIN_L8B_BITS; n = sizeof(CHAIN_L8B_BITS)/sizeof(CHAIN_L8B_BITS[0]); break;
+    case 3: arr = CHAIN_C0_BITS;  n = sizeof(CHAIN_C0_BITS)/sizeof(CHAIN_C0_BITS[0]); break;
+    case 4: arr = CHAIN_C1_BITS;  n = sizeof(CHAIN_C1_BITS)/sizeof(CHAIN_C1_BITS[0]); break;
+    case 5: arr = CHAIN_C2_BITS;  n = sizeof(CHAIN_C2_BITS)/sizeof(CHAIN_C2_BITS[0]); break;
+    case 6: arr = CHAIN_C3_BITS;  n = sizeof(CHAIN_C3_BITS)/sizeof(CHAIN_C3_BITS[0]); break;
+    default: return false;
+    }
+    for (int i = 0; i < n; i++) if (arr[i] == bit) return true;
+    return false;
+}
+
+static inline int compute_slice_10_with_edit(uint64_t phys_addr, int chain_idx, int toggle_bit) {
+    int l6b = hash_l6b(phys_addr) & 1;
+    int l6c = hash_l6c(phys_addr) & 1;
+    int l8b = hash_l8b(phys_addr) & 1;
+    int c0  = hash_c0(phys_addr) & 1;
+    int c1  = hash_c1(phys_addr) & 1;
+    int c2  = hash_c2(phys_addr) & 1;
+    int c3  = hash_c3(phys_addr) & 1;
+
+    int delta = B(phys_addr, toggle_bit);
+    switch (chain_idx) {
+    case 0: l6b ^= delta; break;
+    case 1: l6c ^= delta; break;
+    case 2: l8b ^= delta; break;
+    case 3: c0  ^= delta; break;
+    case 4: c1  ^= delta; break;
+    case 5: c2  ^= delta; break;
+    case 6: c3  ^= delta; break;
+    default: break;
+    }
+
+    int m3 = (c0 & c1 & (c2 | c3)) & 1;
+    int m2 = ((~m3) & l6c) & 1;
+    int m1 = ((~m3) & l8b) & 1;
+    int mixer = (m1 << 0) | (m2 << 1) | (m3 << 2);
+    return l6b | (mixer << 1);
+}
+
+static void print_confusion_matrix(const std::vector<VerifySample> &samples, int nslices) {
+    if (samples.empty()) return;
+
+    std::vector<std::vector<long long>> conf(nslices, std::vector<long long>(nslices, 0));
+    long long bit_mismatch[4] = {0, 0, 0, 0};
+    long long total = (long long)samples.size();
+    long long correct = 0;
+
+    for (const auto &s : samples) {
+        if (s.measured >= 0 && s.measured < nslices && s.predicted >= 0 && s.predicted < nslices)
+            conf[s.measured][s.predicted]++;
+        if (s.measured == s.predicted) correct++;
+        for (int b = 0; b < 4; b++) {
+            if (((s.measured >> b) & 1) != ((s.predicted >> b) & 1)) bit_mismatch[b]++;
+        }
+    }
+
+    printf("Confusion matrix (rows=measured, cols=predicted):\n");
+    printf("      ");
+    for (int c = 0; c < nslices; c++) printf(" %5d", c);
+    printf("\n");
+    for (int r = 0; r < nslices; r++) {
+        printf("m=%2d :", r);
+        for (int c = 0; c < nslices; c++) printf(" %5lld", conf[r][c]);
+        printf("\n");
+    }
+    printf("Verification accuracy: %lld / %lld (%.4f%%)\n",
+           correct, total, total > 0 ? 100.0 * (double)correct / (double)total : 0.0);
+    printf("Output-bit mismatch rates: b0=%.2f%% b1=%.2f%% b2=%.2f%% b3=%.2f%%\n\n",
+           total > 0 ? 100.0 * (double)bit_mismatch[0] / (double)total : 0.0,
+           total > 0 ? 100.0 * (double)bit_mismatch[1] / (double)total : 0.0,
+           total > 0 ? 100.0 * (double)bit_mismatch[2] / (double)total : 0.0,
+           total > 0 ? 100.0 * (double)bit_mismatch[3] / (double)total : 0.0);
+}
+
+struct TuneCandidate {
+    int chain_idx;
+    int bit;
+    int add_op; // 1 add, 0 remove
+    long long correct;
+};
+
+static void run_hash_autotune(const std::vector<VerifySample> &samples,
+                              int bit_min, int bit_max, int top_n)
+{
+    if (samples.empty()) return;
+    if (bit_min > bit_max) return;
+
+    static const char *kChainName[7] = {"l6b", "l6c", "l8b", "c0", "c1", "c2", "c3"};
+    long long base_correct = 0;
+    for (const auto &s : samples) if (s.measured == s.predicted) base_correct++;
+
+    std::vector<TuneCandidate> best;
+    for (int chain = 0; chain < 7; chain++) {
+        for (int bit = bit_min; bit <= bit_max; bit++) {
+            long long corr = 0;
+            for (const auto &s : samples) {
+                int pred = compute_slice_10_with_edit(s.pa, chain, bit);
+                if (pred == s.measured) corr++;
+            }
+            if (corr <= base_correct) continue;
+
+            TuneCandidate cand;
+            cand.chain_idx = chain;
+            cand.bit = bit;
+            cand.add_op = chain_contains_bit(chain, bit) ? 0 : 1;
+            cand.correct = corr;
+            best.push_back(cand);
+        }
+    }
+
+    std::sort(best.begin(), best.end(), [](const TuneCandidate &a, const TuneCandidate &b){
+        if (a.correct != b.correct) return a.correct > b.correct;
+        if (a.chain_idx != b.chain_idx) return a.chain_idx < b.chain_idx;
+        return a.bit < b.bit;
+    });
+
+    printf("Auto-tune (single term toggle) in bits [%d, %d]:\n", bit_min, bit_max);
+    if (best.empty()) {
+        printf("  No single-term change improved accuracy.\n\n");
+        return;
+    }
+
+    int limit = std::min((int)best.size(), top_n);
+    for (int i = 0; i < limit; i++) {
+        const auto &c = best[i];
+        printf("  %2d) %s bit %d in %s -> %lld / %zu (%.4f%%)\n",
+               i + 1,
+               c.add_op ? "add" : "remove",
+               c.bit, kChainName[c.chain_idx],
+               c.correct, samples.size(),
+               100.0 * (double)c.correct / (double)samples.size());
+    }
+    printf("\n");
 }
 
 // Embedded 10-slice function:
@@ -581,12 +741,17 @@ int main(int argc, char *argv[]) {
         {"target-slice", required_argument, 0, 'T'},
         {"use-embedded-hash", no_argument, 0, 'H'},
         {"verify-hash",       no_argument, 0, 'V'},
+        {"print-confusion",   no_argument, 0, 'C'},
+        {"auto-tune-hash",    no_argument, 0, 'U'},
+        {"tune-bit-min", required_argument, 0, 'M'},
+        {"tune-bit-max", required_argument, 0, 'X'},
+        {"tune-top",     required_argument, 0, 'P'},
         {0, 0, 0, 0}
     };
 
     int c;
     // parse command line arguments
-    while ((c = getopt_long(argc, argv, "a:c:g:m:k:v:f:n:HV", long_options, NULL)) != EOF) {
+    while ((c = getopt_long(argc, argv, "a:c:g:m:k:v:f:n:HVCUM:X:P:", long_options, NULL)) != EOF) {
         switch (c) {
         case 'a':
             g_access_type = (strncmp(optarg, "write", 5) == 0) ? 1 : 0;
@@ -631,6 +796,15 @@ int main(int argc, char *argv[]) {
         case 'V':
             g_verify_hash = 1;
             break;
+        case 'C':
+            g_print_confusion = 1;
+            break;
+        case 'U':
+            g_auto_tune_hash = 1;
+            break;
+        case 'P':
+            g_tune_top = atoi(optarg);
+            break;
         default:
             printf("Usage: %s [options]\n"
                    "Required:\n"
@@ -647,7 +821,10 @@ int main(int argc, char *argv[]) {
                    "  -n <threads>           number of attack threads (default: 1)\n"
                    "  -v <level>             verbosity (default: 1)\n"
                    "  --use-embedded-hash    use embedded recovered 10-slice function\n"
-                   "  --verify-hash          verify hash prediction with CHA probing\n",
+                   "  --verify-hash          verify hash prediction with CHA probing\n"
+                   "  --print-confusion      print measured-vs-predicted confusion matrix\n"
+                   "  --auto-tune-hash       search single-term chain edits improving accuracy\n"
+                   "  --tune-top <N>         number of best edits to print (default: 10)\n",
                    argv[0]);
             exit(0);
         }
@@ -671,6 +848,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: embedded hash mode currently supports only --slices 10\n");
         exit(1);
     }
+    if (g_tune_top <= 0) g_tune_top = 3;
+    if (g_verify_hash && !g_print_confusion) g_print_confusion = 1;
 
     if (geteuid() != 0) {
         fprintf(stderr, "Error: must run as root (perf_event_open for uncore events)\n");
@@ -720,6 +899,7 @@ int main(int argc, char *argv[]) {
     long long hash_checked = 0;
     long long hash_correct = 0;
     long long hash_mismatch = 0;
+    std::vector<VerifySample> verify_samples;
 
     while ((int)slice_addrs.size() < g_target_n) {
         // pick a random cache-line-aligned address from the mapping
@@ -741,6 +921,7 @@ int main(int argc, char *argv[]) {
                     hash_checked++;
                     if (measured == slice) hash_correct++;
                     else hash_mismatch++;
+                    verify_samples.push_back({pa, measured, slice});
                 }
             }
         } else {
@@ -773,6 +954,12 @@ int main(int argc, char *argv[]) {
         printf("  Correct       : %lld (%.2f%%)\n", hash_correct,
                100.0 * (double)hash_correct / (double)hash_checked);
         printf("  Mismatch      : %lld\n\n", hash_mismatch);
+        if (g_print_confusion) {
+            print_confusion_matrix(verify_samples, g_nslices);
+        }
+        if (g_auto_tune_hash) {
+            run_hash_autotune(verify_samples, g_tune_bit_min, g_tune_bit_max, g_tune_top);
+        }
     }
 
     // Store found addresses as a single set
