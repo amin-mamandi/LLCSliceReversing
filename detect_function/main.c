@@ -18,7 +18,7 @@
 #include "../slice_functions/slice_functions.h"
 
 #define MEMSIZE (1 * 1024ul * 1024ul * 1024ul)
-#define ADDRESSES 100
+#define ADDRESSES 256
 
 #define BASE_PATH "/sys/bus/event_source/devices/"
 #define CBOX_PREFIX "uncore_cbox_"
@@ -107,7 +107,7 @@ size_t find_slice_perf(void *address, int repeat, int *slice_count,
   }
 
   if (subnuma && *subnuma == 1) {
-    slices=10;
+    slices = 10;
   }    
 
   int did_find = 0;
@@ -248,9 +248,7 @@ int main(int argc, char *argv[]) {
   
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--subnuma") == 0) {
-      if (i + 1 < argc) {
-        subnuma = 1
-      }
+      subnuma = 1;
     }
   }
 
