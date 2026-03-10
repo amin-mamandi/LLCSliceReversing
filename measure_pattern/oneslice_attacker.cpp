@@ -9,9 +9,13 @@
 //
 // Compile:
 //    g++ -O2 -std=c++17 -o oneslice_attacker oneslice_attacker.cpp -lpthread
-// Usage:
-//   $ sudo ./oneslice_attacker --base 0x1c --event 0xf50 --slices 40 \
-//          --target-slice 0 -k 500 -m 4096 -a write -n 4
+// Usage: [currently only works for 10-slices]
+//   $ sudo ./oneslice_attacker --base 0x1c --event 0xf50 --slices 10 \
+//          --target-slice 0 -k 500 -m 4096 -a write -n 4 --use-embedded-hash \
+//          --verify-hash \
+//          --print-confusion \
+//          --auto-tune-hash \
+//          --tune-top 3
 // Note:
 //   Must run as root (perf_event_open for uncore events).
 //   Adjust --base, --event, --slices for your platform.
