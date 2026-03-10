@@ -356,12 +356,7 @@ int main(int argc, char *argv[]) {
         return 1;
       } 
     } else if (strcmp(argv[i], "--subnuma") == 0) {
-      if (i + 1 < argc) {
         subnuma = 1;
-      } else {
-        print_usage(argv[0]);
-        return 1;
-      }
     } else {
       print_usage(argv[0]);
       return 1;
